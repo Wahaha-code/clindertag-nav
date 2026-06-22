@@ -1,0 +1,29 @@
+%YAML:1.0
+---
+
+# Legacy calibration (kept for reference):
+# cameraMatrix: !!opencv-matrix
+#    rows: 3
+#    cols: 3
+#    dt: f
+#    data: [ 613.72058105, 0., 638.58703613, 0.,
+#        613.79449463, 399.03610229, 0., 0., 1. ]
+# distCoeffs: !!opencv-matrix
+#    rows: 8
+#    cols: 1
+#    dt: f
+#    data: [ -0.03227209, 0.03582532, 0.00046068, -0.00043696,
+#        -0.0126295, 0., 0., 0. ]
+
+cameraMatrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: f
+   data: [ 2254.83642578, 0., 1889.98999023, 0.,
+       2252.97875977, 1082.32336426, 0., 0., 1. ]
+distCoeffs: !!opencv-matrix
+   rows: 8
+   cols: 1
+   dt: f
+   data: [ 0.08228063, -0.11077784, -2.6983749e-05, -3.9594661e-04,
+       0.04675483, 0., 0., 0. ]
