@@ -4,14 +4,14 @@ global ID tag_length
 
 ID=[];
 tag_length = 1200;
-CylinderTagGenerator(12, 2, 42, 15);  % 12列、特征大小2、生成41个tag、ratio=15
-
+CylinderTagGenerator(12, 2, 1, 15);  % 12列、特征大小2、生成41个tag、ratio=15
 
 function max_number=select(feature_size)
     global judge_usage
     max_number=0;
     for i = 1:size(judge_usage,1)
         code = i - 1;
+       
         judge_usage(i) = 1;
         illegal = 0;
         for j=1:feature_size
