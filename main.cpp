@@ -48,7 +48,7 @@ int main(int argc, char** argv){
 	}
 	const fs::path asset_root = exec_path.parent_path();
 	const fs::path marker_path = asset_root / "CTag_2f12c.marker";
-	const fs::path model_path = asset_root / "CTag_2f12c.model";
+	const fs::path model_path = asset_root / "CTag_2f12c_d32.model";
 	const fs::path camera_path = asset_root / "cameraParams.yml";
 
 	fs::path input_path = (argc > 1)

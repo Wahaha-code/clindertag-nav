@@ -271,7 +271,7 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=ASSET_ROOT / "CTag_2f12c.model",
+        default=ASSET_ROOT / "CTag_2f12c_d32.model",
         help="Path to reconstructed 3D model.",
     )
     parser.add_argument(

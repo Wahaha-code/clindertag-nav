@@ -307,7 +307,7 @@ def run(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Real-time CylinderTag pose estimation using Orbbec RGB feed.")
     parser.add_argument("--marker-path", type=Path, default=ASSET_ROOT / "CTag_2f12c.marker", help="Path to marker dictionary file.")
-    parser.add_argument("--model-path", type=Path, default=ASSET_ROOT / "CTag_2f12c.model", help="Path to reconstructed 3D model.")
+    parser.add_argument("--model-path", type=Path, default=ASSET_ROOT / "CTag_2f12c_d32.model", help="Path to reconstructed 3D model.")
     parser.add_argument("--camera-path", type=Path, default=ASSET_ROOT / "cameraParams.yml", help="Camera calibration file.")
     parser.add_argument("--adaptive-thresh", type=int, default=5, help="Adaptive threshold window size.")
     parser.add_argument("--disable-subpix", action="store_true", help="Disable sub-pixel corner refinement.")

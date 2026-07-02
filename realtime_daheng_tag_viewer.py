@@ -1,7 +1,10 @@
 import argparse
+import csv
+import math
 import sys
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -39,6 +42,292 @@ ESC_KEY = 27
 DEFAULT_FILENAME = "daheng_cylindertag_recording.mp4"
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 800
+
+
+def as_vector(values, size: int = 3) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    vector = np.asarray(values, dtype=np.float64).reshape(-1)
+    if vector.size != size or not np.all(np.isfinite(vector)):
+        return None
+    return vector
+
+
+def rotation_angle_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
+    rot_a, _ = cv2.Rodrigues(rvec_a.reshape(3, 1))
+    rot_b, _ = cv2.Rodrigues(rvec_b.reshape(3, 1))
+    relative = rot_b @ rot_a.T
+    trace_value = float(np.trace(relative))
+    cos_angle = max(-1.0, min(1.0, (trace_value - 1.0) * 0.5))
+    return math.degrees(math.acos(cos_angle))
+
+
+class DetectionMetrics:
+    def __init__(self, window_size: int, csv_path: Optional[Path], print_every_s: float):
+        self.window_size = max(2, int(window_size))
+        self.print_every_s = max(0.0, float(print_every_s))
+        self.start_time = time.time()
+        self.last_print_time = self.start_time
+
+        self.camera_frames = 0
+        self.empty_frames = 0
+        self.processed_frames = 0
+        self.detected_frames = 0
+        self.pose_frames = 0
+        self.total_markers = 0
+        self.total_processing_ms = 0.0
+        self.reprojection_errors = []
+        self.observation_counts = []
+
+        self.translation_window = deque(maxlen=self.window_size)
+        self.rotation_step_window = deque(maxlen=self.window_size)
+        self.translation_step_window = deque(maxlen=self.window_size)
+        self.previous_tvec = None
+        self.previous_rvec = None
+        self.rotation_jump_count = 0
+
+        self.csv_file = None
+        self.csv_writer = None
+        if csv_path is not None:
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            self.csv_file = csv_path.open("w", newline="")
+            self.csv_writer = csv.DictWriter(
+                self.csv_file,
+                fieldnames=[
+                    "time_s",
+                    "camera_frame",
+                    "processed_frame",
+                    "process_ms",
+                    "detected",
+                    "pose_valid",
+                    "marker_count",
+                    "primary_marker_id",
+                    "feature_count",
+                    "observation_count",
+                    "reprojection_error",
+                    "t_x_mm",
+                    "t_y_mm",
+                    "t_z_mm",
+                    "translation_step_mm",
+                    "rotation_step_deg",
+                ],
+            )
+            self.csv_writer.writeheader()
+
+    def note_camera_frame(self) -> None:
+        self.camera_frames += 1
+
+    def note_empty_frame(self) -> None:
+        self.empty_frames += 1
+
+    def update_detection(
+        self,
+        camera_frame: int,
+        process_ms: float,
+        markers,
+        poses,
+    ) -> None:
+        self.processed_frames += 1
+        marker_count = len(markers)
+        detected = marker_count > 0
+        if detected:
+            self.detected_frames += 1
+        self.total_markers += marker_count
+        self.total_processing_ms += process_ms
+
+        valid_poses = [
+            pose
+            for pose in poses
+            if pose.get("marker_id", -1) >= 0
+            and as_vector(pose.get("rvec")) is not None
+            and as_vector(pose.get("tvec")) is not None
+        ]
+        pose = valid_poses[0] if valid_poses else None
+        pose_valid = pose is not None
+        if pose_valid:
+            self.pose_frames += 1
+
+        marker_id = -1
+        feature_count = 0
+        observation_count = 0
+        reprojection_error = math.nan
+        tvec = None
+        rvec = None
+        translation_step = math.nan
+        rotation_step = math.nan
+
+        if detected:
+            primary_marker = markers[0]
+            marker_id = int(primary_marker.get("marker_id", -1))
+            feature_count = len(primary_marker.get("feature_pos", []))
+
+        if pose_valid:
+            marker_id = int(pose.get("marker_id", marker_id))
+            observation_count = int(pose.get("observation_count", 0))
+            reprojection_error = float(pose.get("reprojection_error", math.nan))
+            if math.isfinite(reprojection_error):
+                self.reprojection_errors.append(reprojection_error)
+            if observation_count > 0:
+                self.observation_counts.append(observation_count)
+
+            tvec = as_vector(pose.get("tvec"))
+            rvec = as_vector(pose.get("rvec"))
+            if tvec is not None:
+                self.translation_window.append(tvec)
+                if self.previous_tvec is not None:
+                    translation_step = float(np.linalg.norm(tvec - self.previous_tvec))
+                    self.translation_step_window.append(translation_step)
+                self.previous_tvec = tvec
+            if rvec is not None:
+                if self.previous_rvec is not None:
+                    rotation_step = rotation_angle_deg(self.previous_rvec, rvec)
+                    self.rotation_step_window.append(rotation_step)
+                    if rotation_step > 90.0:
+                        self.rotation_jump_count += 1
+                self.previous_rvec = rvec
+
+        if self.csv_writer is not None:
+            elapsed = time.time() - self.start_time
+            self.csv_writer.writerow(
+                {
+                    "time_s": f"{elapsed:.3f}",
+                    "camera_frame": camera_frame,
+                    "processed_frame": self.processed_frames,
+                    "process_ms": f"{process_ms:.3f}",
+                    "detected": int(detected),
+                    "pose_valid": int(pose_valid),
+                    "marker_count": marker_count,
+                    "primary_marker_id": marker_id,
+                    "feature_count": feature_count,
+                    "observation_count": observation_count,
+                    "reprojection_error": (
+                        f"{reprojection_error:.6f}"
+                        if math.isfinite(reprojection_error)
+                        else ""
+                    ),
+                    "t_x_mm": f"{tvec[0]:.6f}" if tvec is not None else "",
+                    "t_y_mm": f"{tvec[1]:.6f}" if tvec is not None else "",
+                    "t_z_mm": f"{tvec[2]:.6f}" if tvec is not None else "",
+                    "translation_step_mm": (
+                        f"{translation_step:.6f}"
+                        if math.isfinite(translation_step)
+                        else ""
+                    ),
+                    "rotation_step_deg": (
+                        f"{rotation_step:.6f}" if math.isfinite(rotation_step) else ""
+                    ),
+                }
+            )
+            self.csv_file.flush()
+
+    def summary(self) -> dict:
+        elapsed = max(1e-9, time.time() - self.start_time)
+        detection_rate = (
+            self.detected_frames / self.processed_frames
+            if self.processed_frames
+            else 0.0
+        )
+        pose_rate = (
+            self.pose_frames / self.processed_frames if self.processed_frames else 0.0
+        )
+        avg_process_ms = (
+            self.total_processing_ms / self.processed_frames
+            if self.processed_frames
+            else 0.0
+        )
+        avg_markers = (
+            self.total_markers / self.processed_frames if self.processed_frames else 0.0
+        )
+        avg_reproj = (
+            float(np.mean(self.reprojection_errors)) if self.reprojection_errors else math.nan
+        )
+        avg_obs = (
+            float(np.mean(self.observation_counts)) if self.observation_counts else math.nan
+        )
+
+        if len(self.translation_window) >= 2:
+            translations = np.vstack(self.translation_window)
+            translation_std = np.std(translations, axis=0)
+            translation_std_norm = float(np.linalg.norm(translation_std))
+        else:
+            translation_std = np.array([math.nan, math.nan, math.nan])
+            translation_std_norm = math.nan
+
+        translation_step_rms = (
+            float(np.sqrt(np.mean(np.square(self.translation_step_window))))
+            if self.translation_step_window
+            else math.nan
+        )
+        rotation_step_rms = (
+            float(np.sqrt(np.mean(np.square(self.rotation_step_window))))
+            if self.rotation_step_window
+            else math.nan
+        )
+
+        return {
+            "elapsed_s": elapsed,
+            "camera_frames": self.camera_frames,
+            "empty_frames": self.empty_frames,
+            "processed_frames": self.processed_frames,
+            "detected_frames": self.detected_frames,
+            "pose_frames": self.pose_frames,
+            "camera_fps": self.camera_frames / elapsed,
+            "process_fps": self.processed_frames / elapsed,
+            "detection_rate": detection_rate,
+            "pose_rate": pose_rate,
+            "avg_process_ms": avg_process_ms,
+            "avg_markers": avg_markers,
+            "avg_reprojection_error": avg_reproj,
+            "avg_observation_count": avg_obs,
+            "translation_std_x_mm": float(translation_std[0]),
+            "translation_std_y_mm": float(translation_std[1]),
+            "translation_std_z_mm": float(translation_std[2]),
+            "translation_std_norm_mm": translation_std_norm,
+            "translation_step_rms_mm": translation_step_rms,
+            "rotation_step_rms_deg": rotation_step_rms,
+            "rotation_jump_count": self.rotation_jump_count,
+        }
+
+    def should_print(self) -> bool:
+        if self.print_every_s <= 0:
+            return False
+        now = time.time()
+        if now - self.last_print_time < self.print_every_s:
+            return False
+        self.last_print_time = now
+        return True
+
+    def format_overlay(self):
+        summary = self.summary()
+        return [
+            f"Detect: {summary['detection_rate'] * 100:.1f}% "
+            f"Pose: {summary['pose_rate'] * 100:.1f}%",
+            f"Proc: {summary['avg_process_ms']:.1f} ms "
+            f"Rep: {summary['avg_reprojection_error']:.2f}",
+            f"Jitter: {summary['translation_step_rms_mm']:.2f} mm "
+            f"{summary['rotation_step_rms_deg']:.1f} deg",
+        ]
+
+    def print_summary(self, prefix: str = "Metrics") -> None:
+        summary = self.summary()
+        print(
+            f"{prefix}: "
+            f"camera_frames={summary['camera_frames']}, "
+            f"processed={summary['processed_frames']}, "
+            f"detected={summary['detected_frames']} "
+            f"({summary['detection_rate'] * 100:.1f}%), "
+            f"pose={summary['pose_frames']} ({summary['pose_rate'] * 100:.1f}%), "
+            f"avg_process={summary['avg_process_ms']:.2f}ms, "
+            f"avg_reproj={summary['avg_reprojection_error']:.3f}, "
+            f"t_step_rms={summary['translation_step_rms_mm']:.3f}mm, "
+            f"r_step_rms={summary['rotation_step_rms_deg']:.3f}deg, "
+            f"rot_jumps={summary['rotation_jump_count']}"
+        )
+
+    def close(self) -> None:
+        if self.csv_file is not None:
+            self.csv_file.flush()
+            self.csv_file.close()
 
 
 def annotate_markers(
@@ -104,6 +393,33 @@ def annotate_markers(
                 0,
                 0.2,
             )
+
+
+def draw_metrics_overlay(image: np.ndarray, lines) -> None:
+    x = 20
+    y = 78
+    for line in lines:
+        cv2.putText(
+            image,
+            line,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            line,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (30, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 28
 
 
 def print_devices(device_manager, dev_info_list) -> None:
@@ -301,6 +617,21 @@ def print_stream_counters(cam) -> None:
 
 
 def run(args) -> None:
+    metrics_path = None
+    if not args.disable_metrics:
+        if args.metrics_csv:
+            metrics_path = args.metrics_csv
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            metrics_path = ASSET_ROOT / f"{timestamp}_daheng_metrics.csv"
+        print(f"Writing metrics to {metrics_path}")
+
+    metrics = DetectionMetrics(
+        window_size=args.metrics_window,
+        csv_path=metrics_path,
+        print_every_s=args.metrics_print_every,
+    )
+
     runner = CylinderTagRunner(
         str(args.marker_path),
         str(args.model_path),
@@ -317,6 +648,7 @@ def run(args) -> None:
         device_manager, cam = open_daheng_camera(args)
     except Exception as exc:
         print(f"Failed to open Daheng camera: {exc}")
+        metrics.close()
         return
 
     video_writer = None
@@ -334,7 +666,9 @@ def run(args) -> None:
             raw_image = cam.data_stream[0].get_image()
             frame = raw_image_to_bgr(cam, raw_image)
             if frame is None:
+                metrics.note_empty_frame()
                 continue
+            metrics.note_camera_frame()
 
             if args.flip >= 0:
                 frame = cv2.flip(frame, args.flip)
@@ -362,13 +696,18 @@ def run(args) -> None:
             )
 
             if should_detect:
+                process_start = time.perf_counter()
                 result = runner.process(frame)
+                process_ms = (time.perf_counter() - process_start) * 1000.0
                 markers = result["markers"]
                 poses = result["poses"]
                 last_markers = markers
                 last_pose_map = {
                     pose["marker_id"]: pose for pose in poses if pose["marker_id"] >= 0
                 }
+                metrics.update_detection(frame_counter, process_ms, markers, poses)
+                if metrics.should_print():
+                    metrics.print_summary("Metrics")
 
             if not args.preview_only:
                 if last_markers:
@@ -409,6 +748,9 @@ def run(args) -> None:
                     2,
                 )
 
+            if not args.disable_metrics:
+                draw_metrics_overlay(display, metrics.format_overlay())
+
             if video_writer is not None:
                 video_writer.write(display)
 
@@ -439,6 +781,11 @@ def run(args) -> None:
             print_stream_counters(cam)
         except Exception:
             pass
+        if not args.disable_metrics:
+            metrics.print_summary("Final metrics")
+            if metrics_path is not None:
+                print(f"Metrics CSV: {metrics_path}")
+        metrics.close()
         try:
             cam.close_device()
         except Exception:
@@ -513,7 +860,7 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=ASSET_ROOT / "CTag_2f12c.model",
+        default=ASSET_ROOT / "CTag_2f12c_d32.model",
         help="Path to reconstructed 3D model.",
     )
     parser.add_argument(
@@ -526,6 +873,29 @@ def parse_args():
     parser.add_argument("--disable-subpix", action="store_true", help="Disable sub-pixel corner refinement.")
     parser.add_argument("--subpix-window", type=int, default=5, help="Sub-pixel refinement window radius.")
     parser.add_argument("--axis-length", type=float, default=50.0, help="Axis length in mm.")
+    parser.add_argument(
+        "--disable-metrics",
+        action="store_true",
+        help="Disable detection/stability metric collection and CSV output.",
+    )
+    parser.add_argument(
+        "--metrics-csv",
+        type=Path,
+        default=None,
+        help="CSV path for per-detection metrics. Defaults to timestamp_daheng_metrics.csv.",
+    )
+    parser.add_argument(
+        "--metrics-window",
+        type=int,
+        default=60,
+        help="Rolling pose stability window in processed detection frames.",
+    )
+    parser.add_argument(
+        "--metrics-print-every",
+        type=float,
+        default=2.0,
+        help="Print metric summary every N seconds. Use 0 to disable periodic prints.",
+    )
     parser.add_argument("--record", action="store_true", help="Record the annotated stream to disk.")
     parser.add_argument("--record-fps", type=float, default=30.0, help="FPS used for saved video.")
     parser.add_argument(
